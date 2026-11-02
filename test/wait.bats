@@ -136,6 +136,38 @@ holder_succeeded() {
   assert_holds 3
 }
 
+@test "fails at once when the token can't create the lock commit" {
+  fail_api 403 '^POST git/commits$'
+  fail_message "Resource not accessible by integration"
+  run_wait
+  assert_status 1
+  assert_output_contains "Creating the lock commit failed: gh: Resource not accessible by integration (HTTP 403)"
+  assert_output_contains "The token needs contents: write permission."
+  [ "$(count_calls '^sleep')" -eq 0 ]
+  assert_locks
+  assert_last_commit_status "failure|Waiting for the turn failed, see the log."
+}
+
+@test "retries when creating the lock commit fails for another reason" {
+  fail_api 502 '^POST git/commits$'
+  at_tick 1 'rm "$FAKE_STATE/fail"'
+  run_wait
+  assert_status 0
+  assert_output_contains "Creating the lock commit failed: gh: Fake failure (HTTP 502)"
+  assert_output_contains "Could not take the turn, another run may have been faster."
+  assert_holds 1
+}
+
+@test "retries when creating the lock commit hits a rate limit" {
+  fail_api 403 '^POST git/commits$'
+  fail_message "You have exceeded a secondary rate limit"
+  at_tick 1 'rm "$FAKE_STATE/fail"'
+  run_wait
+  assert_status 0
+  assert_output_contains "Creating the lock commit failed: gh: You have exceeded a secondary rate limit (HTTP 403)"
+  assert_holds 1
+}
+
 @test "fails when the lock ref can't be created" {
   fail_api 403 '^POST git/refs$'
   run_wait
