@@ -63,7 +63,7 @@ jobs:
       contents: write
       pull-requests: read
     concurrency:
-      group: ${{ github.workflow }}-wait-${{ github.head_ref || github.ref }}
+      group: ${{ github.workflow }}-wait-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
     steps:
       - uses: udondan/priority-boarding@v1
@@ -139,11 +139,13 @@ Pass `label-weights: ''` or `status-context: ''` under `with:` to turn them off.
 | `update-pending-branches`      | `false`                     | Rebase pending auto-merge PRs with a higher weight that are behind (below). |
 | `update-token`                 |                             | Token to rebase a PR branch that is behind (see below).                     |
 | `status-context`               |                             | Context of a commit status showing the place in the queue (see below).      |
+| `read-only`                    | `auto`                      | Wait for another run to take the turn for this run, `auto` for forks.       |
+| `run-id`                       |                             | Run to take the turn for, see [forks](#pull-requests-from-forks).           |
 | `token`                        | `github.token`              | Token with `actions: read`, `contents: write` and `pull-requests: read`.    |
 
 ## Workflow setup
 
-**Cancel outdated waiting runs.** A new commit on a branch makes the waiting run of the previous commit outdated. The action fails it at its next check, but until then it takes a runner. A `concurrency` group per branch with `cancel-in-progress` cancels it right away. Put the group on the wait job only, not on the workflow or the jobs after it: once a run has the turn, the wait job is done, so jobs that already use the shared resources are never cancelled and can always clean up.
+**Cancel outdated waiting runs.** A new commit on a branch makes the waiting run of the previous commit outdated. The action fails it at its next check, but until then it takes a runner. A `concurrency` group per pull request with `cancel-in-progress` cancels it right away. Group by pull request number rather than branch name (`github.head_ref`): branches of forks can have the same name. Put the group on the wait job only, not on the workflow or the jobs after it: once a run has the turn, the wait job is done, so jobs that already use the shared resources are never cancelled and can always clean up.
 
 **Fail the jobs after the wait when the wait fails.** When the wait fails, for example as outdated or on timeout, jobs that need it are skipped, and a skipped job counts as passed for required checks. Run them with `if: ${{ !cancelled() }}` and fail them in a first step when the wait didn't succeed, as in the example above. Or require a single job that checks all others:
 
@@ -247,16 +249,53 @@ The token needs `statuses: write`. Without it, the action logs a warning and wai
 
 This action is for repositories without merge queue, for example ones owned by a user, where runs share resources and some pull requests should go first. It adds the order by labels and the handling of outdated branches and auto-merge.
 
+## Pull requests from forks
+
+Runs of pull requests from forks get a read-only token and can't create the lock ref. They still wait in the queue like any other run, ordered by the labels of their pull request. But when such a run is first in line and the turn is free, another run has to take the turn on its behalf. The turn belongs to the run named in the lock, not to the run that created it.
+
+That other run is started by `workflow_run`, which runs the workflow of the default branch with a writable token, also for runs of forks. Add this workflow next to the one that waits, with the `name` of that workflow under `workflows`:
+
+```yaml
+name: Priority boarding for forks
+
+on:
+  workflow_run: # zizmor: ignore[dangerous-triggers] no code of the pull request is run
+    workflows: [Test]
+    types: [in_progress]
+
+permissions: {}
+
+jobs:
+  priority-boarding:
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.head_repository.full_name != github.repository
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+      statuses: write
+    uses: udondan/priority-boarding/.github/workflows/priority-boarding.yml@v1
+    with:
+      run-id: ${{ format('{0}', github.event.workflow_run.id) }}
+```
+
+It starts when the run of the fork starts, waits in that run's place in the queue, takes the turn for it and ends. It also ends when the run of the fork ends first, for example when it is cancelled, or when it tests an outdated commit of its pull request. It never checks out the code of the pull request, so the writable token is not exposed to it. Pass it the same inputs as the waiting job, like `label-weights` and `require-up-to-date`, so both see the same queue. The commit status of the fork's run is set by this run, since the fork's run can't set it.
+
+The run of the fork detects that it is from a fork (`read-only: auto`). It fails when no run took the turn on its behalf within 5 minutes after it was first in line and the turn was free, so a missing `workflow_run` workflow doesn't hold up the queue for long. `in_progress` is also sent for re-runs and when the run of a first-time contributor was approved, unlike `requested`. Branches of forks are never rebased, see [Outdated branches](#outdated-branches).
+
+The list of runs doesn't name the pull request of a fork's run, so it is found by the fork and branch. When one branch of a fork has open pull requests to several base branches, its runs count as runs without a pull request, since they don't say which one they test.
+
+Runs of forks get no secrets on `pull_request`. Only jobs that use the shared resources without secrets can run for them, like a test environment that needs no credentials. Skip the other jobs for forks. A read-only token doesn't make a runner safe for the code of a fork: on a self-hosted runner that is reused, that code can stay on the machine and read the credentials of later jobs, or reach internal services. Run forks only on GitHub-hosted runners or on isolated self-hosted runners that are used for one job and then discarded.
+
 ## Limitations
 
-Pull requests from forks and from Dependabot get a read-only token and can't create the lock ref. The action then fails with a permission error. Skip the wait job for them instead:
+Pull requests from Dependabot get a read-only token and can't create the lock ref. The action then fails with a permission error. Skip the wait job for them instead:
 
 ```yaml
   priority-boarding:
-    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
+    if: github.actor != 'dependabot[bot]'
 ```
 
-Jobs after it then have to treat a skipped wait as success, for example with `if: needs.priority-boarding.result == 'failure' || needs.priority-boarding.result == 'cancelled'` in the `Check turn` step. They don't get the secrets either, so skip the jobs that use the shared resources for them as well.
+Jobs after it then have to treat a skipped wait as success, for example with `if: needs.priority-boarding.result == 'failure' || needs.priority-boarding.result == 'cancelled'` in the `Check turn` step.
 
 ## Testing
 
